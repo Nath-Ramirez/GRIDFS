@@ -1,68 +1,100 @@
-import argparse
-import os
+# client/client.py
 import requests
+import hashlib
+import os
+import sys
+import argparse
 
-NAMENODE = os.environ.get("NAMENODE", "http://localhost:5000")
+NAMENODE = os.environ.get("NAMENODE_URL", "http://namenode:8000")
+BLOCK_SIZE = int(os.environ.get("BLOCK_SIZE", 8*1024*1024))
 
-def put(file_path, user="demo", block_size=8*1024*1024):
-    """Sube un archivo completo al NameNode"""
-    with open(file_path, "rb") as f:
-        files = {"file": (os.path.basename(file_path), f)}
-        data = {"user": user, "block_size": str(block_size)}
-        r = requests.post(f"{NAMENODE}/upload", files=files, data=data)
-        r.raise_for_status()
-        print("PUT ok:", r.json())
+def sha256(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
 
-def get(fname, out_path):
-    """Descarga un archivo del NameNode"""
-    r = requests.get(f"{NAMENODE}/download/{fname}", stream=True)
-    if r.status_code != 200:
-        print("Error:", r.json())
+def put_file(path, user="demo"):
+    filename = os.path.basename(path)
+    # count blocks and sizes
+    sizes = []
+    with open(path,"rb") as f:
+        while True:
+            chunk = f.read(BLOCK_SIZE)
+            if not chunk:
+                break
+            sizes.append(len(chunk))
+    num_blocks = len(sizes)
+    if num_blocks == 0:
+        print("Empty file")
         return
-    with open(out_path, "wb") as f:
-        for chunk in r.iter_content(chunk_size=8192):
-            f.write(chunk)
-    print("GET ok:", out_path)
+    # request allocation
+    r = requests.post(f"{NAMENODE}/namenode/allocate_blocks", json={"filename": filename, "num_blocks": num_blocks, "user": user, "block_size": BLOCK_SIZE})
+    if r.status_code != 200:
+        print("Allocation failed:", r.text); return
+    allocation = r.json()["allocation"]
+    # upload blocks
+    with open(path,"rb") as f:
+        for alloc in allocation:
+            i = alloc["block_index"]
+            block_id = alloc["block_id"]
+            datanode_url = alloc["datanode_url"]
+            chunk = f.read(BLOCK_SIZE)
+            files = {"file": (f"{block_id}.bin", chunk)}
+            try:
+                resp = requests.post(f"{datanode_url}/datanode/store_block", params={"block_id": block_id}, files=files, timeout=10)
+                if resp.status_code != 200:
+                    print("Upload failed to", datanode_url, resp.text); return
+                info = resp.json()
+                checksum = info["checksum"]
+                size = info["size"]
+                # confirm to namenode
+                conf = {
+                    "filename": filename,
+                    "block_index": i,
+                    "block_id": block_id,
+                    "datanode_url": datanode_url,
+                    "size": size,
+                    "checksum": checksum
+                }
+                rc = requests.post(f"{NAMENODE}/namenode/confirm_block", json=conf)
+                if rc.status_code != 200:
+                    print("Confirm failed:", rc.text); return
+                print(f"Uploaded block {i} -> {datanode_url} ({size} bytes)")
+            except Exception as e:
+                print("Error uploading block:", e)
+                return
+    print("Upload finished")
 
-def ls():
-    """Lista archivos registrados"""
-    r = requests.get(f"{NAMENODE}/files")
-    r.raise_for_status()
-    for f in r.json():
-        print(f'{f["name"]}  owner={f["owner"]}  size={f["size"]}')
-
-def rm(fname):
-    """Elimina un archivo del sistema"""
-    r = requests.delete(f"{NAMENODE}/files/{fname}")
-    print("RM status:", r.status_code, r.json())
+def get_file(filename, outpath):
+    r = requests.get(f"{NAMENODE}/namenode/metadata", params={"filename": filename})
+    if r.status_code != 200:
+        print("Metadata error:", r.text); return
+    meta = r.json()
+    if meta["status"] != "available":
+        print("File not available yet. Status:", meta["status"])
+    with open(outpath, "wb") as outf:
+        for b in sorted(meta["blocks"], key=lambda x: x["block_index"]):
+            dn = b["datanode_url"]
+            block_id = b["block_id"]
+            resp = requests.get(f"{dn}/datanode/get_block", params={"block_id": block_id}, stream=True)
+            if resp.status_code != 200:
+                print("Error getting block:", resp.text); return
+            for chunk in resp.iter_content(64*1024):
+                outf.write(chunk)
+            print(f"Downloaded block {b['block_index']} from {dn}")
+    print("Download finished")
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Cliente GridDFS (versión DB centralizada)")
-    sub = ap.add_subparsers(dest="cmd")
-
-    ap_put = sub.add_parser("put")
-    ap_put.add_argument("path")
-    ap_put.add_argument("--user", default="demo")
-    ap_put.add_argument("--block", type=int, default=8*1024*1024)
-
-    ap_get = sub.add_parser("get")
-    ap_get.add_argument("name")
-    ap_get.add_argument("out")
-
-    sub.add_parser("ls")
-
-    ap_rm = sub.add_parser("rm")
-    ap_rm.add_argument("name")
-
-    args = ap.parse_args()
-
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="cmd")
+    p_put = sub.add_parser("put")
+    p_put.add_argument("path")
+    p_put.add_argument("--user", default="demo")
+    p_get = sub.add_parser("get")
+    p_get.add_argument("filename")
+    p_get.add_argument("outpath")
+    args = parser.parse_args()
     if args.cmd == "put":
-        put(args.path, args.user, args.block)
+        put_file(args.path, args.user)
     elif args.cmd == "get":
-        get(args.name, args.out)
-    elif args.cmd == "ls":
-        ls()
-    elif args.cmd == "rm":
-        rm(args.name)
+        get_file(args.filename, args.outpath)
     else:
-        ap.print_help()
+        parser.print_help()

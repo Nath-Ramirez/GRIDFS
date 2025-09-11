@@ -1,136 +1,199 @@
-from flask import Flask, request, jsonify, send_file
-from flask_sqlalchemy import SQLAlchemy
-import os, io, math, docker
+# namenode/app.py
+import sqlite3
+import threading
+import uuid
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List
+import os
+from datetime import datetime
 
-app = Flask(__name__)
+DB_PATH = os.environ.get("NN_DB", "metadata.db")
+lock = threading.Lock()
+app = FastAPI(title="NameNode - GridDFS (SQLite)")
 
-# --- Configuración Base de Datos (SQLite para demo) ---
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///namenode.db'
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-db = SQLAlchemy(app)
+# --- DB helpers --------------------------------------------------------
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS datanodes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        url TEXT UNIQUE,
+        capacity INTEGER,
+        free INTEGER,
+        last_seen TEXT
+    )""")
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        filename TEXT UNIQUE,
+        owner TEXT,
+        size INTEGER,
+        block_size INTEGER,
+        status TEXT,
+        created_at TEXT
+    )""")
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS blocks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_id INTEGER,
+        block_index INTEGER,
+        block_id TEXT UNIQUE,
+        datanode_url TEXT,
+        size INTEGER,
+        checksum TEXT,
+        present INTEGER DEFAULT 0,
+        FOREIGN KEY(file_id) REFERENCES files(id)
+    )""")
+    conn.commit()
+    conn.close()
 
-# --- Modelos SQL ---
-class File(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String, unique=True, nullable=False)
-    owner = db.Column(db.String, nullable=False)
-    size = db.Column(db.Integer, nullable=False)
-    block_size = db.Column(db.Integer, nullable=False)
+def db_conn():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
 
-class Block(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    file_id = db.Column(db.Integer, db.ForeignKey('file.id'), nullable=False)
-    index = db.Column(db.Integer, nullable=False)
-    datanode_url = db.Column(db.String, nullable=False)
-    block_id = db.Column(db.String, nullable=False)
+init_db()
 
-# --- Docker client (para lanzar DataNodes) ---
-docker_client = docker.from_env()
+# --- Pydantic models ---------------------------------------------------
+class RegisterDN(BaseModel):
+    datanode_url: str
+    capacity: int = None
+    free: int = None
 
-# Crear tablas
-with app.app_context():
-    db.create_all()
+class AllocateReq(BaseModel):
+    filename: str
+    num_blocks: int
+    user: str = "demo"
+    block_size: int = None
 
-# --- Endpoints ---
+class ConfirmBlockReq(BaseModel):
+    filename: str
+    block_index: int
+    block_id: str
+    datanode_url: str
+    size: int
+    checksum: str
 
-@app.post("/upload")
-def upload_file():
-    # Recibe archivo
-    file = request.files['file']
-    owner = request.form.get("user", "demo")
-    block_size = int(request.form.get("block_size", 8*1024*1024))  # 8MB default
+# --- Endpoints --------------------------------------------------------
+@app.post("/namenode/register_datanode")
+def register_datanode(info: RegisterDN):
+    with lock:
+        conn = db_conn()
+        c = conn.cursor()
+        now = datetime.utcnow().isoformat()
+        c.execute("INSERT OR REPLACE INTO datanodes(url, capacity, free, last_seen) VALUES (?, ?, ?, ?)",
+                  (info.datanode_url, info.capacity or -1, info.free or -1, now))
+        conn.commit()
+        conn.close()
+    return {"status": "ok", "datanode_url": info.datanode_url}
 
-    data = file.read()
-    size = len(data)
-    n_blocks = math.ceil(size / block_size)
+@app.post("/namenode/allocate_blocks")
+def allocate_blocks(req: AllocateReq):
+    with lock:
+        conn = db_conn()
+        c = conn.cursor()
 
-    # Guardar metadatos archivo
-    f = File(name=file.filename, owner=owner, size=size, block_size=block_size)
-    db.session.add(f)
-    db.session.commit()
+        # get datanodes
+        c.execute("SELECT url FROM datanodes ORDER BY id")
+        dns = [row[0] for row in c.fetchall()]
+        if len(dns) == 0:
+            raise HTTPException(status_code=503, detail="no datanodes registered")
 
-    # Particionar y crear DataNodes
-    for i in range(n_blocks):
-        chunk = data[i*block_size:(i+1)*block_size]
-        block_id = f"{file.filename}-{i}"
+        # create file entry (if not exists) with status incomplete
+        now = datetime.utcnow().isoformat()
+        c.execute("INSERT OR IGNORE INTO files(filename, owner, size, block_size, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                  (req.filename, req.user, None, req.block_size or 0, "incomplete", now))
+        conn.commit()
 
-        # Crear contenedor Docker para este bloque
-        container = docker_client.containers.run(
-            "griddfs-datanode:latest",  # Imagen del DataNode
-            detach=True,
-            environment={
-                "BLOCK_ID": block_id,
-                "BLOCK_DATA": chunk.hex(),  # guardamos binario como hex string
-            },
-            ports={'5001/tcp': None}  # puerto dinámico
-        )
+        # get file id
+        c.execute("SELECT id FROM files WHERE filename=?", (req.filename,))
+        file_id = c.fetchone()[0]
 
-        # Obtener puerto asignado dinámicamente
-        container.reload()
-        port = container.attrs['NetworkSettings']['Ports']['5001/tcp'][0]['HostPort']
-        datanode_url = f"http://localhost:{port}"
+        allocation = []
+        # create placeholder block rows
+        for i in range(req.num_blocks):
+            dn = dns[i % len(dns)]
+            block_id = f"{req.filename}__{i}__{uuid.uuid4().hex}"
+            c.execute("""INSERT OR IGNORE INTO blocks(file_id, block_index, block_id, datanode_url, size, checksum, present)
+                         VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                      (file_id, i, block_id, dn, 0, "", 0))
+            allocation.append({"block_index": i, "datanode_url": dn, "block_id": block_id})
+        conn.commit()
+        conn.close()
+    return {"allocation": allocation}
 
-        # Guardar metadatos bloque
-        b = Block(file_id=f.id, index=i, datanode_url=datanode_url, block_id=block_id)
-        db.session.add(b)
+@app.post("/namenode/confirm_block")
+def confirm_block(info: ConfirmBlockReq):
+    with lock:
+        conn = db_conn()
+        c = conn.cursor()
+        # find file
+        c.execute("SELECT id FROM files WHERE filename=?", (info.filename,))
+        row = c.fetchone()
+        if not row:
+            conn.close()
+            raise HTTPException(status_code=404, detail="file not found")
+        file_id = row[0]
 
-    db.session.commit()
+        # update block
+        c.execute("""UPDATE blocks SET size=?, checksum=?, present=1, datanode_url=?
+                     WHERE file_id=? AND block_index=? AND block_id=?""",
+                  (info.size, info.checksum, info.datanode_url, file_id, info.block_index, info.block_id))
+        conn.commit()
 
-    return jsonify({"status": "ok", "file": file.filename, "blocks": n_blocks})
+        # check if all blocks present
+        c.execute("SELECT COUNT(*) FROM blocks WHERE file_id=?",(file_id,))
+        total = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM blocks WHERE file_id=? AND present=1",(file_id,))
+        present = c.fetchone()[0]
+        if present == total and total > 0:
+            # set file available and compute total size
+            c.execute("SELECT SUM(size) FROM blocks WHERE file_id=?", (file_id,))
+            total_size = c.fetchone()[0] or 0
+            c.execute("UPDATE files SET status='available', size=?, block_size=? WHERE id=?",
+                      (total_size, None, file_id))
+        conn.commit()
+        conn.close()
+    return {"status":"ok"}
 
+@app.get("/namenode/metadata")
+def get_metadata(filename: str):
+    conn = db_conn()
+    c = conn.cursor()
+    c.execute("SELECT id, owner, size, block_size, status, created_at FROM files WHERE filename=?", (filename,))
+    r = c.fetchone()
+    if not r:
+        conn.close()
+        raise HTTPException(status_code=404, detail="file not found")
+    file_id, owner, size, block_size, status, created_at = r
+    c.execute("""SELECT block_index, block_id, datanode_url, size, checksum, present
+                 FROM blocks WHERE file_id=? ORDER BY block_index""", (file_id,))
+    blocks = []
+    for b in c.fetchall():
+        blocks.append({
+            "block_index": b[0],
+            "block_id": b[1],
+            "datanode_url": b[2],
+            "size": b[3],
+            "checksum": b[4],
+            "present": bool(b[5])
+        })
+    conn.close()
+    return {
+        "filename": filename,
+        "owner": owner,
+        "size": size,
+        "block_size": block_size,
+        "status": status,
+        "created_at": created_at,
+        "blocks": blocks
+    }
 
-@app.get("/download/<fname>")
-def download_file(fname):
-    # Buscar archivo
-    f = File.query.filter_by(name=fname).first()
-    if not f:
-        return jsonify({"error": "file not found"}), 404
-
-    # Buscar bloques
-    blocks = Block.query.filter_by(file_id=f.id).order_by(Block.index).all()
-    result = io.BytesIO()
-
-    # Reconstruir el archivo desde DataNodes
-    import requests
-    for b in blocks:
-        resp = requests.get(f"{b.datanode_url}/blocks/{b.block_id}")
-        if resp.status_code != 200:
-            return jsonify({"error": f"missing block {b.block_id}"}), 500
-        result.write(resp.content)
-
-    result.seek(0)
-    return send_file(result, as_attachment=True, download_name=fname)
-
-
-@app.get("/files")
-def list_files():
-    files = File.query.all()
-    return jsonify([{"name": f.name, "owner": f.owner, "size": f.size} for f in files])
-
-
-@app.delete("/files/<fname>")
-def delete_file(fname):
-    f = File.query.filter_by(name=fname).first()
-    if not f:
-        return jsonify({"error": "file not found"}), 404
-
-    # Borrar bloques (y contenedores asociados)
-    blocks = Block.query.filter_by(file_id=f.id).all()
-    for b in blocks:
-        # Buscar contenedor por block_id y detenerlo
-        try:
-            c = docker_client.containers.get(b.block_id)
-            c.remove(force=True)
-        except:
-            pass
-        db.session.delete(b)
-
-    db.session.delete(f)
-    db.session.commit()
-
-    return jsonify({"status": "deleted", "file": fname})
-
-
-@app.get("/health")
-def health():
-    return jsonify({"ok": True})
+@app.get("/namenode/list_datanodes")
+def list_datanodes():
+    conn = db_conn()
+    c = conn.cursor()
+    c.execute("SELECT url, capacity, free, last_seen FROM datanodes")
+    res = [{"url":r[0],"capacity":r[1],"free":r[2],"last_seen":r[3]} for r in c.fetchall()]
+    conn.close()
+    return {"datanodes": res}

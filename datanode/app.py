@@ -1,40 +1,69 @@
-from flask import Flask, jsonify, Response
-import os, binascii
+# datanode/app.py
+import os
+import hashlib
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import StreamingResponse
+import aiofiles
+import requests
+from pydantic import BaseModel
+from typing import Optional
+from starlette.background import BackgroundTasks
 
-app = Flask(__name__)
+DATA_DIR = os.environ.get("DATA_DIR", "/data/blocks")
+NAMENODE = os.environ.get("NAMENODE_URL", "http://namenode:8000")
+SELF_URL = os.environ.get("DATANODE_URL", "http://datanode:8001")
 
-# --- Configuración inicial ---
-BLOCK_ID = os.environ.get("BLOCK_ID")
-BLOCK_DATA_HEX = os.environ.get("BLOCK_DATA")
+os.makedirs(DATA_DIR, exist_ok=True)
 
-if not BLOCK_ID or not BLOCK_DATA_HEX:
-    raise SystemExit("Faltan variables de entorno BLOCK_ID o BLOCK_DATA")
+app = FastAPI(title="DataNode - GridDFS")
 
-# Convertimos de hex → bytes para guardarlo en memoria
-BLOCK_DATA = binascii.unhexlify(BLOCK_DATA_HEX.encode())
+class RegInfo(BaseModel):
+    datanode_url: str
+    capacity: int = -1
+    free: int = -1
 
-@app.get("/blocks/<block_id>")
-def get_block(block_id):
-    """Devuelve el contenido del bloque si coincide el ID"""
-    if block_id != BLOCK_ID:
-        return jsonify({"error": "block not found"}), 404
-    return Response(BLOCK_DATA, mimetype="application/octet-stream")
+@app.on_event("startup")
+def register_to_namenode():
+    try:
+        info = {"datanode_url": SELF_URL, "capacity": -1, "free": -1}
+        requests.post(f"{NAMENODE}/namenode/register_datanode", json=info, timeout=3)
+        print("Registered to NameNode:", NAMENODE)
+    except Exception as e:
+        print("Could not register to NameNode:", e)
 
-@app.delete("/blocks/<block_id>")
-def delete_block(block_id):
-    """Elimina el bloque y apaga el contenedor"""
-    if block_id != BLOCK_ID:
-        return jsonify({"error": "block not found"}), 404
-    # Simular borrado en memoria
-    global BLOCK_DATA
-    BLOCK_DATA = None
-    # Opcional: terminar el contenedor
-    os._exit(0)  # mata el proceso → Docker lo interpreta como contenedor terminado
-    return jsonify({"status": "deleted"})
+@app.post("/datanode/store_block")
+async def store_block(block_id: str, file: UploadFile = File(...)):
+    safe_name = block_id.replace("/", "_")
+    path = os.path.join(DATA_DIR, safe_name)
+    content = await file.read()
+    # write atomically
+    tmp = path + ".tmp"
+    async with aiofiles.open(tmp, "wb") as f:
+        await f.write(content)
+    os.replace(tmp, path)
+    checksum = hashlib.sha256(content).hexdigest()
+    return {"status":"ok", "block_id": safe_name, "size": len(content), "checksum": checksum}
 
-@app.get("/health")
-def health():
-    return jsonify({"ok": True, "block_id": BLOCK_ID, "size": len(BLOCK_DATA)})
+@app.get("/datanode/get_block")
+def get_block(block_id: str):
+    safe_name = block_id.replace("/", "_")
+    path = os.path.join(DATA_DIR, safe_name)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="block not found")
+    def iterfile():
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(64*1024)
+                if not chunk:
+                    break
+                yield chunk
+    return StreamingResponse(iterfile(), media_type="application/octet-stream")
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001)
+@app.get("/datanode/list_blocks")
+def list_blocks():
+    items = []
+    for name in os.listdir(DATA_DIR):
+        p = os.path.join(DATA_DIR, name)
+        if os.path.isfile(p):
+            items.append({"block_id": name, "size": os.path.getsize(p)})
+    return {"blocks": items}

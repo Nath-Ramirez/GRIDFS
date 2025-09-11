@@ -1,0 +1,55 @@
+version: "3.8"
+services:
+  namenode:
+    build: ./namenode
+    container_name: namenode
+    ports:
+      - "8000:8000"
+    volumes:
+      - nn_data:/data
+    environment:
+      - NN_DB=/data/metadata.db
+
+  datanode1:
+    build: ./datanode
+    container_name: datanode1
+    ports:
+      - "8001:8001"
+    environment:
+      - NAMENODE_URL=http://namenode:8000
+      - DATANODE_URL=http://datanode1:8001
+    volumes:
+      - dn1_blocks:/data/blocks
+    depends_on:
+      - namenode
+
+  datanode2:
+    build: ./datanode
+    container_name: datanode2
+    ports:
+      - "8002:8001"   # mapa 8002 (host) -> 8001 (container)
+    environment:
+      - NAMENODE_URL=http://namenode:8000
+      - DATANODE_URL=http://datanode2:8001
+    volumes:
+      - dn2_blocks:/data/blocks
+    depends_on:
+      - namenode
+
+  client:
+    build: ./client
+    container_name: grid-client
+    environment:
+      - NAMENODE_URL=http://namenode:8000
+      - BLOCK_SIZE=8388608
+    depends_on:
+      - namenode
+      - datanode1
+      - datanode2
+    tty: true
+    stdin_open: true
+
+volumes:
+  nn_data:
+  dn1_blocks:
+  dn2_blocks:
