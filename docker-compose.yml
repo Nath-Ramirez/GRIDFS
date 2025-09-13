@@ -10,46 +10,29 @@ services:
     environment:
       - NN_DB=/data/metadata.db
 
-  datanode1:
+  datanode:
     build: ./datanode
-    container_name: datanode1
-    ports:
-      - "8001:8001"
     environment:
       - NAMENODE_URL=http://namenode:8000
-      - DATANODE_URL=http://datanode1:8001
+      # DATANODE_URL lo genera Docker con el nombre dinámico del contenedor (como http://datanode1:8001, http://datanode2:8001...)
     volumes:
-      - dn1_blocks:/data/blocks
+      - dn_blocks:/data/blocks
     depends_on:
       - namenode
-
-  datanode2:
-    build: ./datanode
-    container_name: datanode2
-    ports:
-      - "8002:8001"   # mapa 8002 (host) -> 8001 (container)
-    environment:
-      - NAMENODE_URL=http://namenode:8000
-      - DATANODE_URL=http://datanode2:8001
-    volumes:
-      - dn2_blocks:/data/blocks
-    depends_on:
-      - namenode
+    expose:
+      - "8001"   #  Cada datanode escucha internamente en 8001
 
   client:
     build: ./client
     container_name: grid-client
     environment:
       - NAMENODE_URL=http://namenode:8000
-      - BLOCK_SIZE=8388608
+      - BLOCK_SIZE=65536
     depends_on:
       - namenode
-      - datanode1
-      - datanode2
     tty: true
     stdin_open: true
 
 volumes:
   nn_data:
-  dn1_blocks:
-  dn2_blocks:
+  dn_blocks:

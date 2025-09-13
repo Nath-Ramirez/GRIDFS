@@ -11,7 +11,9 @@ from starlette.background import BackgroundTasks
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data/blocks")
 NAMENODE = os.environ.get("NAMENODE_URL", "http://namenode:8000")
-SELF_URL = os.environ.get("DATANODE_URL", "http://datanode:8001")
+HOSTNAME = os.environ.get("HOSTNAME") or "datanode"
+SELF_URL = os.environ.get("DATANODE_URL", f"http://{HOSTNAME}:8001") # Estas dos lineas se hacen para que cada contenedor "datanode" tenga su
+                                                                     #  propia URL y no se sobreescriban las URLs de los contenedores                                         
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
