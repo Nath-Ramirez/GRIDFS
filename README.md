@@ -1,27 +1,26 @@
 
 # Sistemas Distribuidos
-#
 # Estudiantes: 
 John Esteban Úsuga Duarte, jeusugad@eafit.edu.co
 
 Nathaly Ramirez Henao, nramirezh@eafitedu.co
 
 Gia Mariana Calle Higuita, gmcalleh@eafit.edu.co
+
 #
+
 # Profesor: 
 Edwin Nelson Montoya Munera, emontoya@eafit.brightspace.com
-#
 
-# nombre del proyecto
-## Proyecto 1: GridFS
+# Proyecto 1: GridFS
 
-# 1. breve descripción de la actividad
+# 1. Descripción
 Este proyecto implementa un sistema de archivos distribuido por bloques, inspirado en HDFS y GFS, utilizando Python, FastAPI y Docker. El sistema se compone de un NameNode, encargado de gestionar los metadatos y coordinar la ubicación de los bloques, varios DataNodes que almacenan físicamente los datos, y un cliente CLI que permite a los usuarios interactuar con el sistema, definir la cantidad de bloques en las que se partirá el archivo y recuperarlos para armar nuevamente el archivo.
 
 Los archivos se dividen en bloques de tamaño fijo y se distribuyen entre los DataNodes siguiendo un esquema round-robin, lo que asegura un reparto equilibrado. El sistema soporta operaciones de subida (put), descarga (get), listado de directorios (ls), creación y eliminación de directorios (mkdir, rmdir), así como eliminación de archivos (rm). Además, incluye autenticación de usuarios con contraseñas encriptadas, y los DataNodes envían heartbeats periódicos al NameNode para reportar su estado.
 
 Gracias al uso de Docker Compose, es posible desplegar el clúster de manera sencilla, escalar dinámicamente la cantidad de DataNodes y mantener un entorno de ejecución controlado y reproducible.
-## 1.1. Que aspectos cumplió o desarrolló de la actividad propuesta por el profesor (requerimientos funcionales y no funcionales)
+## 1.1. Aspectos que se cumplieron
 - NameNode central que mantiene la tabla de metadatos
 - Múltiples DataNodes que almacenan los bloques
 - Cliente que interactúa con el DFS
@@ -31,10 +30,10 @@ Gracias al uso de Docker Compose, es posible desplegar el clúster de manera sen
 - Cada archivo se particiona en bloques distribuidos sin replicación
 - Comunicación por REST sobre HTTP
 - Ejecución nativa en Docker
-## 1.2. Que aspectos NO cumplió o desarrolló de la actividad propuesta por el profesor (requerimientos funcionales y no funcionales)
+## 1.2. Aspectos que no se cumplieron
 - Despliegue en AWS
 - Interfaz amigable para insertar los comandos como usuario
-# 2. información general de diseño de alto nivel, arquitectura, patrones, mejores prácticas utilizadas.
+# 2. Información general de diseño de alto nivel, arquitectura, patrones, mejores prácticas utilizadas.
 El sistema se diseñó bajo una arquitectura P2P híbrida con servidor, en la que el NameNode funciona como servidor central encargado de la coordinación y administración de metadatos, mientras que los DataNodes y los clientes actúan como pares que manejan directamente la transferencia y almacenamiento de bloques. De esta forma, el NameNode no almacena archivos, sino que facilita la interacción entre clientes y DataNodes.
 
 El cliente tiene un rol fundamental dentro del diseño, ya que es el encargado de fragmentar los archivos en bloques al momento de subirlos (put), y al realizar una descarga (get), reconstruir el archivo en su forma original a partir de los bloques recuperados. Además, el cliente implementa comandos de gestión como ls, mkdir, rmdir y rm, y se autentica contra el sistema con usuario y contraseña para garantizar un acceso seguro.
@@ -55,15 +54,36 @@ El proyecto fue desarrollado en Python 3.11, utilizando un conjunto de librería
 - bcrypt 4.0+ → librería para encriptar contraseñas de usuarios y garantizar autenticación segura.
 - Docker 24+ y Docker Compose 2+ → herramientas de contenedorización y orquestación, que permiten desplegar el NameNode, los DataNodes y el cliente de forma aislada y escalable.
 - El código se estructuró en tres componentes principales (namenode, datanode, client), cada uno con su propio contenedor y definido a partir de imágenes basadas en python:3.11-slim. Esto asegura un entorno reproducible y consistente en cualquier máquina de desarrollo o producción.
-## como se compila y ejecuta.
-## detalles del desarrollo.
+
+## ¿Cómo se compila?
+Como se explicó anteriormente, la ejecución se hace a través de docker. Para esto se utilizan los siguientes comandos:
+
+Este comando se usa para crear las imagenes e iniciar los conteiners en Docker: ```docker-compose up```
+
+Este comando se usa para iniciar 3 datanodes en el sistema FS: ```docker-compose up -d --scale datanode=3```
+
+Este comando se usa para registrar un usuario. Después de `register` se introduce el nombre del usuario y su contraseña: ```docker-compose run --rm client register john 123321```
+
+Este comando se usa para hacer put. El archivo Luna.jpg se debe encontrar dentro de la carpeta testdata y debe existir el usuario y contraseña: ```docker-compose run --rm -v "$(pwd)/testdata:/data" client put /data/Luna.jpg --user john --password 123321```
+
+Este comando se usa para hacer get del archivo Luna.jpg. La reconstrucción se guardará en la carpeta testdata como salidaLuna.jpg: ```docker-compose run --rm -v "$(pwd)/testdata:/data" client get Luna.jpg /data/salidaLuna.jpg --user john --password 123321```
+
+Este comando sirve para ver las diferencias entre archivo original y el recuperado: ```diff testdata/Luna.jpg testdata/salidaLuna.jpg```
+
+Este comando se usa para crear una carpeta, en este caso "docs": ```docker-compose run --rm client mkdir /user/demo/docs --user john --password 123321```
+
+Este comando se usa para listar una carpeta, en este caso "docs": ```docker-compose run --rm client ls /user/demo/docs --user john --password 123321```
+
+Este comando se usa para eliminar un archivo, en este caso "Luna.jpg" ```docker-compose run --rm client rm Luna.jpg --user john --password 123321```
+
+## Detalles del desarrollo
 El sistema fue implementado en Python 3.11, siguiendo una arquitectura P2P híbrida con servidor. El desarrollo se dividió en tres módulos principales: NameNode, DataNode y Cliente (CLI).
 
 - El NameNode se encarga de la gestión de metadatos, autenticación de usuarios y coordinación de la distribución de bloques.
 - Los DataNodes almacenan físicamente los bloques y envían heartbeats periódicos al NameNode para notificar su estado.
 - El Cliente implementa la lógica de dividir archivos en bloques al subirlos (put), reconstruirlos al descargarlos (get) y ejecutar operaciones de gestión como ls, rm, mkdir y rmdir.
 - Se trabajó bajo un esquema modular, con APIs REST expuestas mediante FastAPI y orquestación de servicios con Docker Compose, lo que permite desplegar el sistema de forma aislada, portable y escalable.
-## detalles técnicos
+## Detalles técnicos
 - Lenguaje: Python 3.11
 - Framework principal: FastAPI (para NameNode y DataNode)
 - Servidor ASGI: Uvicorn
@@ -74,7 +94,8 @@ El sistema fue implementado en Python 3.11, siguiendo una arquitectura P2P híbr
 - Imagen base: python:3.11-slim
 - Arquitectura: P2P híbrida con servidor central (NameNode)
 - Distribución de bloques: algoritmo round-robin
-## descripción y como se configura los parámetros del proyecto (ej: ip, puertos, conexión a bases de datos, variables de ambiente, parámetros, etc)
+  
+## Descripción y configuración parámetros del proyecto
 El proyecto utiliza variables de entorno y parámetros configurables en los Dockerfiles y docker-compose.yml. Los más relevantes son:
 
 ### NameNode:
@@ -127,50 +148,63 @@ Red interna de Docker para comunicación entre nodos.
 - Carpeta local utilizada para almacenar archivos de prueba que se suben y descargan a través del cliente. Se monta como volumen dentro del contenedor para facilitar la interacción entre el host y el sistema distribuido.
 ### Archivo docker-compose.yml:
 - Archivo de orquestación que define y coordina los servicios (NameNode, DataNodes y cliente). Permite escalar el número de DataNodes y configurar redes internas para la comunicación entre los contenedores.
-## 
-## opcionalmente - si quiere mostrar resultados o pantallazos 
-
 
 # 4. Descripción del ambiente de EJECUCIÓN (en producción) lenguaje de programación, librerias, paquetes, etc, con sus numeros de versiones.
 
-# IP o nombres de dominio en nube o en la máquina servidor.
+## Descripción y configuración de parámetros del proyecto
 
-## descripción y como se configura los parámetros del proyecto (ej: ip, puertos, conexión a bases de datos, variables de ambiente, parámetros, etc)
+El proyecto está diseñado para ejecutarse en **Docker**, lo que facilita la configuración de red, almacenamiento y despliegue de servicios.  
 
-## como se lanza el servidor.
+### Componentes y Puertos
+- **NameNode**
+  - Puerto: `8000`
+  - Función: gestiona los metadatos, usuarios y directorios.
+- **DataNodes**
+  - Puerto: `8001` (puede variar al escalar con Docker)
+  - Función: almacenan físicamente los bloques de datos.
+- **Cliente (CLI)**
+  - Interactúa con NameNode y DataNodes mediante solicitudes REST.
 
-## una mini guia de como un usuario utilizaría el software o la aplicación
+### Base de Datos
+- Se utiliza **SQLite** en el NameNode para guardar:
+  - Archivos y sus metadatos.
+  - Usuarios y contraseñas (encriptadas con **bcrypt**).
+  - Directorios lógicos.
+- Ruta de la base: configurada con `NN_DB` (por defecto `metadata.db`).
 
-## opcionalmente - si quiere mostrar resultados o pantallazos 
+### Variables de Entorno
+- `NN_DB`: ubicación de la base de datos del NameNode.
+- `DATANODES`: lista inicial de DataNodes (opcional).
+- `DATA_DIR`: directorio en cada DataNode donde se guardan los bloques (`/data/blocks` por defecto).
+- `NAMENODE_URL`: URL del NameNode (por defecto `http://namenode:8000`).
+- `BLOCK_SIZE`: tamaño de bloque en bytes (default: 64 KB).
 
-# 5. otra información que considere relevante para esta actividad.
+### Parámetros del Cliente CLI
+- `--user` y `--password`: credenciales del usuario.
+- `--dest`: directorio destino dentro del DFS.
+- `--block_size`: tamaño de bloque configurable al subir un archivo.
+- Comandos disponibles: `put`, `get`, `ls`, `rm`, `mkdir`, `rmdir`, `register`.
 
-# referencias:
-<debemos siempre reconocer los créditos de partes del código que reutilizaremos, así como referencias a youtube, o referencias bibliográficas utilizadas para desarrollar el proyecto o la actividad>
-## sitio1-url 
-## sitio2-url
-## url de donde tomo info para desarrollar este proyecto
-=======
-Correrlo en Docker:
-Creamos las imágenes y contenedores de cliente, namenode y datanode1, desde la raiz del proyecto: docker-compose up --build -d
+### Otros detalles
+- Los DataNodes envían **heartbeats** cada 10 segundos al NameNode para indicar que están activos.
+- El sistema soporta **multiusuario** con autenticación y gestión de directorios lógicos.
 
-Para crear mas datanodes dinámicamnete: docker-compose up -d --scale datanode=3 
-(se crearán datanode2 y datanode3, quedando con 3 datanodes en total. La URL de los datanodes ya no aparecerá bonita como "datanode1"... Sino que aparecerá un string raro porque así es como lo crea Docker, con hash)
+## ¿Cómo se lanza el servidor?
 
-Para que el contenedor client vea el archivo, lo más sencillo es montar la carpeta testdata en /data del contenedor: 
-docker-compose run --rm -v "$(pwd)/testdata:/data" client put /data/Luna.jpg --user nathaly
+El sistema se ejecuta con **Docker Compose** desde la raíz del proyecto:
 
-Para ver todos los datanodes enlistados: curl http://localhost:8000/namenode/list_datanodes
+```docker-compose up --build -d```
 
-Comprobar metadata desde el namenode: curl "http://localhost:8000/namenode/metadata?filename=Luna.jpg (no importa si se queda parado, es como pendejo, pero en teoría debería aparecer toda la información de la tabla, junto con la lista de todos los bloques en los que se partió el archivo)
+Esto levanta los contenedores del NameNode, los DataNodes y el Cliente.
 
-Para ver los bloques guardados en cada datanode:
-docker exec nombreRaroDeDataNode ls -l /data/blocks
+Para escalar el número de DataNodes se puede usar, por ejemplo:
 
-Para descargar el archivo (hacer get) con el cliente: 
-docker-compose run --rm -v "$(pwd)/testdata:/data" client get Luna.jpg /data/salidaLuna.jpg --user nathaly
+```docker-compose up -d --scale datanode=3```
 
-Para comparar los archivos: diff testdata/Luna.jpg testdata/salidaLuna.jpg && echo "Coinciden" || echo "Diferentes"
+# 5. Información adicional
 
-Para probar el ls: docker-compose run --rm client ls /user/nathaly
->>>>>>> 1ca33000bbecd4494f9719611f8d365366b15b91
+## Referencias
+
+https://hadoop.apache.org/docs/r1.2.1/hdfs_design.html
+
+https://www.analyticsvidhya.com/blog/2022/04/an-overview-of-hdfs-namenodes-and-datanodes/
