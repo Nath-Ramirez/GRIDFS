@@ -8,6 +8,7 @@ import requests
 from pydantic import BaseModel
 from typing import Optional
 from starlette.background import BackgroundTasks
+import threading, time
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data/blocks")
 NAMENODE = os.environ.get("NAMENODE_URL", "http://namenode:8000")
@@ -23,6 +24,15 @@ class RegInfo(BaseModel):
     datanode_url: str
     capacity: int = -1
     free: int = -1
+def heartbeat_loop():
+    while True:
+        try:
+            info = {"datanode_url": SELF_URL, "capacity": -1, "free": -1}
+            requests.post(f"{NAMENODE}/namenode/heartbeat", json=info, timeout=3)
+            print(f"Heartbeat enviado a {NAMENODE}")
+        except Exception as e:
+            print("Error enviando heartbeat:", e)
+        time.sleep(10)  # cada 10 segundos
 
 @app.on_event("startup")
 def register_to_namenode():
@@ -32,6 +42,11 @@ def register_to_namenode():
         print("Registered to NameNode:", NAMENODE)
     except Exception as e:
         print("Could not register to NameNode:", e)
+
+    # lanzar hilo de heartbeat
+    t = threading.Thread(target=heartbeat_loop, daemon=True)
+    t.start()
+
 
 @app.post("/datanode/store_block")
 async def store_block(block_id: str, file: UploadFile = File(...)):
@@ -69,3 +84,14 @@ def list_blocks():
         if os.path.isfile(p):
             items.append({"block_id": name, "size": os.path.getsize(p)})
     return {"blocks": items}
+
+
+@app.delete("/datanode/delete_block")
+def delete_block(block_id: str):
+    safe_name = block_id.replace("/", "_")
+    path = os.path.join(DATA_DIR, safe_name)
+    if os.path.exists(path):
+        os.remove(path)
+        return {"status": "ok", "deleted": block_id}
+    else:
+        raise HTTPException(status_code=404, detail="block not found")

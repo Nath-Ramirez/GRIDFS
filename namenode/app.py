@@ -4,12 +4,19 @@ import threading
 import uuid
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+import requests
 import os, json
-from datetime import datetime
+from datetime import datetime, timedelta
+from passlib.context import CryptContext
+
+
 
 DB_PATH = os.environ.get("NN_DB", "metadata.db")
 lock = threading.Lock()
 app = FastAPI(title="NameNode - GridDFS (SQLite single-table + datanode registry)")
+
+# Contexto de hashing para contraseñas. Usamos el algoritmo bcrypt.
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # --- DB helpers --------------------------------------------------------
 def init_db():
@@ -35,6 +42,12 @@ def init_db():
         free INTEGER,
         last_seen TEXT
     )""")
+    # tabla para usuarios (autenticación)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        username TEXT PRIMARY KEY,
+        password_hash TEXT
+    )""")
     conn.commit()
 
     # seed inicial desde variable de entorno DATANODES (si viene definida)
@@ -44,8 +57,46 @@ def init_db():
         for url in [u.strip() for u in env.split(",") if u.strip()]:
             c.execute("INSERT OR IGNORE INTO datanodes(url, capacity, free, last_seen) VALUES (?, ?, ?, ?)",
                       (url, -1, -1, now))
+
+    # Si no existe un usuario "demo", se crea
+    c.execute("SELECT username FROM users WHERE username='demo'")
+    if not c.fetchone():
+        hashed_pass = pwd_context.hash("demo")
+        c.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)", ("demo", hashed_pass))
     conn.commit()
     conn.close()
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_user_from_db(username, conn):
+    c = conn.cursor()
+    c.execute("SELECT password_hash FROM users WHERE username=?", (username,))
+    row = c.fetchone()
+    if row:
+        return {"username": username, "password_hash": row[0]}
+    return None
+
+def auth_user(username, password):
+    """Función de ayuda para autenticar un usuario en cada endpoint."""
+    conn = db_conn()
+    user_data = get_user_from_db(username, conn)
+    conn.close()
+    if user_data and verify_password(password, user_data["password_hash"]):
+        return True
+    return False
+
+def get_active_datanodes(conn, timeout=30):
+    now = datetime.utcnow()
+    c = conn.cursor()
+    rows = c.execute("SELECT url, last_seen FROM datanodes").fetchall()
+    active = []
+    for url, last_seen in rows:
+        if last_seen:
+            last_seen_dt = datetime.fromisoformat(last_seen)
+            if now - last_seen_dt < timedelta(seconds=timeout):
+                active.append(url)
+    return active
 
 def db_conn():
     # cada llamada obtiene una conexión con check_same_thread=False para uso multi-hilo
@@ -54,13 +105,16 @@ def db_conn():
 init_db()
 
 # --- Pydantic models ---------------------------------------------------
-class AllocateReq(BaseModel):
+
+class BaseAuth(BaseModel):
+    user: str
+    password: str
+class AllocateReq(BaseAuth):
     filename: str
     num_blocks: int
-    user: str = "demo"
     block_size: int = None
 
-class ConfirmBlockReq(BaseModel):
+class ConfirmBlockReq(BaseAuth):
     filename: str
     block_index: int
     block_id: str
@@ -73,6 +127,15 @@ class RegInfo(BaseModel):
     capacity: int = -1
     free: int = -1
 
+class MkdirReq(BaseAuth):
+    path: str
+
+class RmdirReq(BaseAuth):
+    path: str
+
+class UserReq(BaseModel):
+    username: str
+    password: str
 # --- Helper -----------------------------------------------------------
 def get_registered_datanodes(conn=None):
     """Retorna lista de URLs de datanodes registrados (en orden arbitario)."""
@@ -87,6 +150,20 @@ def get_registered_datanodes(conn=None):
     return [{"url": r[0], "capacity": r[1], "free": r[2], "last_seen": r[3]} for r in rows]
 
 # --- Endpoints --------------------------------------------------------
+@app.post("/namenode/heartbeat")
+def heartbeat(info: RegInfo):
+    """
+    Recibe un pulso de vida desde un DataNode y actualiza last_seen.
+    """
+    with lock:
+        conn = db_conn()
+        c = conn.cursor()
+        now = datetime.utcnow().isoformat()
+        c.execute("UPDATE datanodes SET last_seen=? WHERE url=?", (now, info.datanode_url))
+        conn.commit()
+        conn.close()
+    return {"status": "ok", "msg": f"Heartbeat recibido de {info.datanode_url}"}
+
 @app.post("/namenode/register_datanode")
 def register_datanode(info: RegInfo):
     """
@@ -121,12 +198,17 @@ def allocate_blocks(req: AllocateReq):
     Asigna bloques para un archivo; usa la lista actual de datanodes registrados.
     La asignación se hace en round-robin sobre la lista de datanodes conocida.
     """
+    if not auth_user(req.user, req.password):
+        raise HTTPException(status_code=401, detail="Credenciales inválidas")
+    
     with lock:
         conn = db_conn()
         c = conn.cursor()
 
-        # obtener datanodes registrados
-        datanode_rows = c.execute("SELECT url FROM datanodes").fetchall()
+        # obtener datanodes activos (last_seen < 60 segundos desde ahora)
+        active_datanodes = get_active_datanodes(conn, timeout=60)
+        datanodes = active_datanodes
+        datanode_rows = c.execute("SELECT url FROM datanodes").fetchall() 
         datanodes = [r[0] for r in datanode_rows]
         if not datanodes:
             # si no hay ninguno registrado, fallback a la var de entorno (por compatibilidad)
@@ -177,6 +259,9 @@ def confirm_block(info: ConfirmBlockReq):
     El cliente (o DataNode, según diseño) confirma que un bloque fue almacenado en el DataNode.
     Actualiza la entrada del bloque en blocks_json y marca 'present'.
     """
+    if not auth_user(info.user, info.password):
+        raise HTTPException(status_code=401, detail="Credenciales inválidas")
+
     with lock:
         conn = db_conn()
         c = conn.cursor()
@@ -211,10 +296,15 @@ def confirm_block(info: ConfirmBlockReq):
     return {"status": "ok"}
 
 @app.get("/namenode/metadata")
-def get_metadata(filename: str):
+def get_metadata(filename: str, user: str , password: str ):
+    """
+    Retorna los metadatos de un archivo, incluyendo la lista de bloques y su estado.
+    """
+    if not auth_user(user, password):
+        raise HTTPException(status_code=401, detail="Credenciales inválidas")
     conn = db_conn()
     c = conn.cursor()
-    c.execute("SELECT filename, owner, size, block_size, status, created_at, blocks_json FROM files WHERE filename=?", (filename,))
+    c.execute("SELECT filename, owner, size, block_size, status, created_at, blocks_json FROM files WHERE filename=? AND owner=?", (filename, user,))
     row = c.fetchone()
     conn.close()
     if not row:
@@ -232,7 +322,13 @@ def get_metadata(filename: str):
     }
 
 @app.get("/namenode/list_files")
-def list_files():
+def list_files( user: str , password: str ):
+    """
+    Lista todos los archivos en el sistema.
+    """
+
+    if not auth_user(user, password):
+        raise HTTPException(status_code=401, detail="Credenciales inválidas")
     conn = db_conn()
     c = conn.cursor()
     c.execute("SELECT filename, size, status, created_at FROM files")
@@ -241,21 +337,144 @@ def list_files():
     return {"files": res}
 
 @app.get("/namenode/ls")
-def list_path(path: str = "/"):
+def list_path(path: str = "/", user: str = "", password: str = ""):
     """
     Lista archivos cuyo nombre empieza con el prefijo `path/`.
     Ejemplo: path="/user/demo" → lista /user/demo/file1, /user/demo/file2
     """
+    if not auth_user(user, password):
+        raise HTTPException(status_code=401, detail="Credenciales inválidas")
     conn = db_conn()
     c = conn.cursor()
     like_pattern = path.rstrip("/") + "/%"
-    rows = c.execute(
-        "SELECT filename, size, status FROM files WHERE filename LIKE ?",
-        (like_pattern,)
-    ).fetchall()
+    if user:
+        like_pattern = f"{path.rstrip('/')}/%"
+        rows = c.execute("SELECT filename, size, status FROM files WHERE filename LIKE ? AND owner=?", (like_pattern, user)).fetchall()
+    else:
+        rows = c.execute(
+            "SELECT filename, size, status FROM files WHERE filename LIKE ?",
+            (like_pattern,)
+        ).fetchall()
     conn.close()
     return {
         "files": [
             {"filename": r[0], "size": r[1], "status": r[2]} for r in rows
         ]
     }
+
+@app.delete("/namenode/delete_file")
+def delete_file(filename: str, user: str , password: str ):
+    """
+    Elimina un archivo del sistema:
+    1. Lee los metadatos y obtiene los bloques.
+    2. Envía request a cada DataNode para borrar los bloques.
+    3. Elimina el registro en la tabla files.
+    """
+    if not auth_user(user, password):
+        raise HTTPException(status_code=401, detail="Credenciales inválidas")
+    with lock:
+        conn = db_conn()
+        c = conn.cursor()
+        c.execute("SELECT owner, blocks_json FROM files WHERE filename=?", (filename,))
+        row = c.fetchone()
+        if not row:
+            conn.close()
+            raise HTTPException(status_code=404, detail="file not found")
+
+        owner, blocks_json = row
+        if owner != user:
+            conn.close()
+            raise HTTPException(status_code=403, detail="no permission to delete this file")
+
+        blocks = json.loads(blocks_json)
+
+        # borrar bloques en los datanodes
+        for b in blocks:
+            try:
+                dn = b["datanode_url"]
+                block_id = b["block_id"]
+                requests.delete(f"{dn}/datanode/delete_block", params={"block_id": block_id}, timeout=3)
+            except Exception as e:
+                print(f" Error eliminando bloque {block_id} en {dn}: {e}")
+
+        # borrar metadatos
+        c.execute("DELETE FROM files WHERE filename=?", (filename,))
+        conn.commit()
+        conn.close()
+    return {"status": "ok", "deleted": filename}
+
+
+@app.post("/namenode/mkdir")
+def mkdir(req: MkdirReq):
+    """
+    Crea un directorio lógico.
+    Realmente solo inserta un placeholder en files con status='dir'.
+    """
+    if not auth_user(req.user, req.password):
+        raise HTTPException(status_code=401, detail="Credenciales inválidas")
+    path = req.path
+    if not path.startswith("/"):
+        raise HTTPException(status_code=400, detail="path must start with /")
+
+    with lock:
+        conn = db_conn()
+        c = conn.cursor()
+        now = datetime.utcnow().isoformat()
+        owner = req.user
+        c.execute("""INSERT OR IGNORE INTO files(filename, owner, size, block_size, status, created_at, blocks_json) 
+                 VALUES (?, ?, ?, ?, ?, ?, ?)""",
+              (path.rstrip("/"), owner, 0, 0, "dir", now, "[]"))
+        conn.commit()
+        conn.close()
+    return {"status": "ok", "mkdir": path}
+
+
+@app.post("/namenode/rmdir")
+def rmdir(req: RmdirReq):
+    """
+    Elimina un directorio lógico y todos los archivos bajo ese prefijo.
+    """
+    if not auth_user(req.user, req.password):
+        raise HTTPException(status_code=401, detail="Credenciales inválidas")
+    path = req.path
+    prefix = path.rstrip("/") + "/%"
+    with lock:
+        conn = db_conn()
+        c = conn.cursor()
+        rows = c.execute("SELECT filename FROM files WHERE filename LIKE ?", (prefix,)).fetchall()
+
+        for r in rows:
+            fname = r[0]
+            # llamada recursiva: delete_file
+            try:
+                delete_file(fname)
+            except Exception as e:
+                print(f" Error eliminando {fname}: {e}")
+
+        # borrar el propio directorio
+        c.execute("DELETE FROM files WHERE filename=?", (path.rstrip("/"),))
+        conn.commit()
+        conn.close()
+    return {"status": "ok", "rmdir": path, "deleted_files": [r[0] for r in rows]}
+
+@app.post("/namenode/register")
+def register_user(req: UserReq):
+    with lock:
+        conn = db_conn()
+        c = conn.cursor()
+        try:
+            hashed_pass = pwd_context.hash(req.password)
+            c.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)", (req.username, hashed_pass))
+            conn.commit()
+            conn.close()
+            return {"status": "ok", "message": f"Usuario {req.username} creado exitosamente"}
+        except sqlite3.IntegrityError:
+            conn.close()
+            raise HTTPException(status_code=400, detail="El usuario ya existe")
+
+@app.post("/namenode/login")
+def login_user(req: UserReq):
+    if auth_user(req.username, req.password):
+        return {"status": "ok", "message": "Autenticación exitosa"}
+    else:
+        raise HTTPException(status_code=401, detail="Credenciales inválidas")
