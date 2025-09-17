@@ -1,7 +1,7 @@
 
 # Sistemas Distribuidos
 # Link con video demostrativo
-https://youtu.be/9fW-qQ6bOIg
+https://youtu.be/JUxdiKg2Bxs
 # Estudiantes: 
 John Esteban Úsuga Duarte, jeusugad@eafit.edu.co
 
@@ -32,6 +32,7 @@ Gracias al uso de Docker Compose, es posible desplegar el clúster de manera sen
 - Cada archivo se particiona en bloques distribuidos sin replicación
 - Comunicación por REST sobre HTTP
 - Ejecución nativa en Docker
+- Despliegue en AWS
 ## 1.2. Aspectos que no se cumplieron
 - Interfaz amigable para insertar los comandos como usuario
 # 2. Información general de diseño de alto nivel, arquitectura, patrones, mejores prácticas utilizadas.
