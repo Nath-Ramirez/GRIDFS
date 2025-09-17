@@ -33,7 +33,6 @@ Gracias al uso de Docker Compose, es posible desplegar el clúster de manera sen
 - Comunicación por REST sobre HTTP
 - Ejecución nativa en Docker
 ## 1.2. Aspectos que no se cumplieron
-- Despliegue en AWS
 - Interfaz amigable para insertar los comandos como usuario
 # 2. Información general de diseño de alto nivel, arquitectura, patrones, mejores prácticas utilizadas.
 El sistema se diseñó bajo una arquitectura P2P híbrida con servidor, en la que el NameNode funciona como servidor central encargado de la coordinación y administración de metadatos, mientras que los DataNodes y los clientes actúan como pares que manejan directamente la transferencia y almacenamiento de bloques. De esta forma, el NameNode no almacena archivos, sino que facilita la interacción entre clientes y DataNodes.
